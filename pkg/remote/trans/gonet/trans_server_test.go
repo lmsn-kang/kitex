@@ -110,13 +110,42 @@ func TestCreateListener(t *testing.T) {
 }
 
 func TestShutdownWithoutActiveConnections(t *testing.T) {
-	transSvr := NewTransServerFactory().NewTransServer(
+	svr := NewTransServerFactory().NewTransServer(
 		&remote.ServerOption{ExitWaitTime: 10 * time.Millisecond},
 		&mocks.MockSvrTransHandler{},
 	).(*transServer)
 
-	err := transSvr.Shutdown()
+	err := svr.Shutdown()
 	test.Assert(t, err == nil, err)
+}
+
+// TestShutdownBootstrappedWithoutActiveConnections covers the production path
+// where the accept loop is running with a real listener (ln != nil) and the
+// graceful-shutdown branch is executed, while no client has ever connected.
+func TestShutdownBootstrappedWithoutActiveConnections(t *testing.T) {
+	svr := NewTransServerFactory().NewTransServer(
+		&remote.ServerOption{ExitWaitTime: 10 * time.Millisecond},
+		&mocks.MockSvrTransHandler{},
+	).(*transServer)
+
+	ln, err := svr.CreateListener(utils.NewNetAddr("tcp", "127.0.0.1:0"))
+	test.Assert(t, err == nil, err)
+	svr.ln = ln
+	done := make(chan struct{})
+	go func() {
+		svr.BootstrapServer(ln)
+		close(done)
+	}()
+	// ensure BootstrapServer has set ts.ln and is blocked on Accept
+	time.Sleep(50 * time.Millisecond)
+
+	err = svr.Shutdown()
+	test.Assert(t, err == nil, err)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("BootstrapServer did not exit")
+	}
 }
 
 func TestBootStrapAndShutdown(t *testing.T) {
@@ -201,6 +230,9 @@ func TestServeConn(t *testing.T) {
 		},
 		Opt: transSvr.opt,
 	}
+	// connCount is incremented by the accept loop (BootstrapServer) before
+	// spawning serveConn; simulate that here since we call serveConn directly.
+	transSvr.connCount.Inc()
 	err := transSvr.serveConn(context.Background(), mockConn)
 	test.Assert(t, connCnt == 1)
 	test.Assert(t, err == expectedErr)
@@ -217,6 +249,7 @@ func TestServeConn(t *testing.T) {
 	mockConn.ReadFunc = func(b []byte) (n int, err error) {
 		return 0, io.EOF
 	}
+	transSvr.connCount.Inc()
 	err = transSvr.serveConn(context.Background(), mockConn)
 	test.Assert(t, err == expectedErr)
 	test.Assert(t, isClosed)
@@ -238,6 +271,7 @@ func TestServeConn(t *testing.T) {
 		},
 		Opt: transSvr.opt,
 	}
+	transSvr.connCount.Inc()
 	err = transSvr.serveConn(context.Background(), mockConn)
 	test.Assert(t, err == expectedErr)
 	test.Assert(t, isClosed)
@@ -253,6 +287,7 @@ func TestServeConn(t *testing.T) {
 	mockConn.ReadFunc = func(b []byte) (n int, err error) {
 		panic("xxx panic read")
 	}
+	transSvr.connCount.Inc()
 	transSvr.serveConn(context.Background(), mockConn)
 	test.Assert(t, isClosed)
 }
